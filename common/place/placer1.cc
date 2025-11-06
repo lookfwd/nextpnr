@@ -143,6 +143,9 @@ class SAPlacer
         size_t placed_cells = 0;
         std::vector<CellInfo *> autoplaced;
         std::vector<CellInfo *> chain_basis;
+        // OPTIMIZATION: Reserve capacity to avoid reallocations
+        autoplaced.reserve(ctx->cells.size());
+        chain_basis.reserve(ctx->cells.size() / 10); // Estimate ~10% are chains
         if (!refine) {
             // Initial constraints placer
             for (auto &cell_entry : ctx->cells) {
@@ -267,7 +270,11 @@ class SAPlacer
                          "%.0f, wirelen = %.0f\n",
                          iter, temp, double(curr_timing_cost), double(curr_wirelen_cost));
 
-            for (int m = 0; m < 15; ++m) {
+            // OPTIMIZATION: Adaptive inner loop iterations
+            // Early iterations: more exploration (15 iterations)
+            // Later iterations: faster convergence (10 iterations) as temperature cools
+            int inner_iters = (iter < 10) ? 15 : 10;
+            for (int m = 0; m < inner_iters; ++m) {
                 // Loop through all automatically placed cells
                 for (auto cell : autoplaced) {
                     // Find another random Bel for this cell
@@ -370,10 +377,20 @@ class SAPlacer
             }
 
             // Invoke timing analysis to obtain criticalities
-            if (cfg.timing_driven)
-                tmg.run();
+            // OPTIMIZATION: Only run timing analysis periodically, not every iteration
+            // Early iterations: every 3 iterations (placement changes rapidly)
+            // Later iterations: every 5 iterations (placement stabilizes)
+            bool should_update_timing = false;
+            if (cfg.timing_driven) {
+                int timing_update_freq = (iter < 10) ? 3 : 5;
+                if (iter % timing_update_freq == 0 || improved) {
+                    tmg.run();
+                    should_update_timing = true;
+                }
+            }
             // Need to rebuild costs after criticalities change
-            setup_costs();
+            if (should_update_timing)
+                setup_costs();
             // Reset incremental bounds
             moveChange.reset(this);
             moveChange.new_net_bounds = net_bounds;

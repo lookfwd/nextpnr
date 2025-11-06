@@ -1861,7 +1861,9 @@ PlacerHeapCfg::PlacerHeapCfg(Context *ctx)
     netShareWeight = ctx->setting<float>("placerHeap/netShareWeight", 0);
 
     timing_driven = ctx->setting<bool>("timing_driven");
-    solverTolerance = 1e-5;
+    // OPTIMIZATION: Relax solver tolerance from 1e-5 to 5e-5 for faster convergence
+    // The HeAP placer is followed by SA refinement, so extreme precision isn't needed
+    solverTolerance = ctx->setting<float>("placerHeap/solverTolerance", 5e-5);
     placeAllAtOnce = false;
     chainRipup = false;
 

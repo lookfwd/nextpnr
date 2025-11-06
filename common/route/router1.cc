@@ -553,6 +553,12 @@ struct Router1
             QueuedWire qw = queue.top();
             queue.pop();
 
+            // OPTIMIZATION: Skip if we've already found a better path to this wire
+            auto visited_it = visited.find(qw.wire);
+            if (visited_it != visited.end() && visited_it->second.randtag != qw.randtag) {
+                continue; // This entry is stale
+            }
+
             for (auto pip : ctx->getPipsDownhill(qw.wire)) {
                 delay_t next_delay = qw.delay + ctx->getPipDelay(pip).maxDelay();
                 delay_t next_penalty = qw.penalty;
