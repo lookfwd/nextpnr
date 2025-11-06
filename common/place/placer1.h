@@ -34,6 +34,9 @@ struct Placer1Cfg
     bool timing_driven;
     int slack_redist_iter;
     int hpwl_scale_x, hpwl_scale_y;
+    // Multi-threading configuration
+    bool parallelRefine = false;
+    int threads = 1;
 };
 
 extern bool placer1(Context *ctx, Placer1Cfg cfg);

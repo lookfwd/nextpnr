@@ -46,6 +46,12 @@
 #include "timing.h"
 #include "util.h"
 
+#if !defined(NPNR_DISABLE_THREADS)
+#include <atomic>
+#include <mutex>
+#include <thread>
+#endif
+
 NEXTPNR_NAMESPACE_BEGIN
 
 class SAPlacer
@@ -133,6 +139,88 @@ class SAPlacer
         for (auto &net : ctx->nets)
             net.second->udata = old_udata[net.second->udata];
     }
+
+#if !defined(NPNR_DISABLE_THREADS)
+    // Multi-threaded inner loop for SA placer
+    void run_parallel_inner_loop(int inner_iters, std::vector<CellInfo *> &autoplaced,
+                                  std::vector<CellInfo *> &chain_basis)
+    {
+        // Partition cells spatially to minimize conflicts between threads
+        int num_threads = std::min(cfg.threads, 8); // Cap at 8 threads
+        std::vector<std::vector<CellInfo *>> partitions(num_threads);
+
+        // Simple spatial hash partitioning based on current cell location
+        for (auto cell : autoplaced) {
+            Loc loc = ctx->getBelLocation(cell->bel);
+            int partition_id = ((loc.x / 4) ^ (loc.y / 4)) % num_threads;
+            partitions[partition_id].push_back(cell);
+        }
+
+        // Partition chains similarly
+        std::vector<std::vector<CellInfo *>> chain_partitions(num_threads);
+        for (auto cb : chain_basis) {
+            Loc loc = ctx->getBelLocation(cb->bel);
+            int partition_id = ((loc.x / 4) ^ (loc.y / 4)) % num_threads;
+            chain_partitions[partition_id].push_back(cb);
+        }
+
+        // Atomic counters for thread-safe tracking
+        std::atomic<int> total_moves{0};
+        std::atomic<int> total_accepts{0};
+        std::mutex cost_mutex; // Protect cost updates
+
+        // Run inner iterations
+        for (int m = 0; m < inner_iters; ++m) {
+            std::vector<std::thread> threads;
+
+            // Launch worker threads
+            for (int t = 0; t < num_threads; ++t) {
+                threads.emplace_back([this, t, &partitions, &chain_partitions, &total_moves, &total_accepts,
+                                      &cost_mutex]() {
+                    // Each thread works on its partition
+                    int local_moves = 0, local_accepts = 0;
+
+                    // Process regular cells in this partition
+                    for (auto cell : partitions[t]) {
+                        BelId try_bel = random_bel_for_cell(cell);
+                        if (try_bel != BelId() && try_bel != cell->bel) {
+                            // Lock cost calculations to prevent races
+                            std::lock_guard<std::mutex> lock(cost_mutex);
+                            if (try_swap_position(cell, try_bel))
+                                local_accepts++;
+                            local_moves++;
+                        }
+                    }
+
+                    // Process chains in this partition
+                    for (auto cb : chain_partitions[t]) {
+                        Loc chain_base_loc = ctx->getBelLocation(cb->bel);
+                        BelId try_base = random_bel_for_cell(cb, chain_base_loc.z);
+                        if (try_base != BelId() && try_base != cb->bel) {
+                            std::lock_guard<std::mutex> lock(cost_mutex);
+                            if (try_swap_chain(cb, try_base))
+                                local_accepts++;
+                            local_moves++;
+                        }
+                    }
+
+                    // Update global counters atomically
+                    total_moves.fetch_add(local_moves, std::memory_order_relaxed);
+                    total_accepts.fetch_add(local_accepts, std::memory_order_relaxed);
+                });
+            }
+
+            // Wait for all threads to complete this iteration
+            for (auto &thread : threads) {
+                thread.join();
+            }
+        }
+
+        // Update global counters
+        n_move += total_moves.load();
+        n_accept += total_accepts.load();
+    }
+#endif
 
     bool place(bool refine = false)
     {
@@ -260,6 +348,13 @@ class SAPlacer
         int n_no_progress = 0;
         temp = refine ? 1e-7 : cfg.startTemp;
 
+#if !defined(NPNR_DISABLE_THREADS)
+        if (cfg.parallelRefine && cfg.threads > 1 && autoplaced.size() > 1000) {
+            log_info("Using multi-threaded SA placer with %d threads for %d cells.\n", cfg.threads,
+                     int(autoplaced.size()));
+        }
+#endif
+
         // Main simulated annealing loop
         for (int iter = 1;; iter++) {
             n_move = n_accept = 0;
@@ -274,22 +369,33 @@ class SAPlacer
             // Early iterations: more exploration (15 iterations)
             // Later iterations: faster convergence (10 iterations) as temperature cools
             int inner_iters = (iter < 10) ? 15 : 10;
-            for (int m = 0; m < inner_iters; ++m) {
-                // Loop through all automatically placed cells
-                for (auto cell : autoplaced) {
-                    // Find another random Bel for this cell
-                    BelId try_bel = random_bel_for_cell(cell);
-                    // If valid, try and swap to a new position and see if
-                    // the new position is valid/worthwhile
-                    if (try_bel != BelId() && try_bel != cell->bel)
-                        try_swap_position(cell, try_bel);
-                }
-                // Also try swapping chains, if applicable
-                for (auto cb : chain_basis) {
-                    Loc chain_base_loc = ctx->getBelLocation(cb->bel);
-                    BelId try_base = random_bel_for_cell(cb, chain_base_loc.z);
-                    if (try_base != BelId() && try_base != cb->bel)
-                        try_swap_chain(cb, try_base);
+
+#if !defined(NPNR_DISABLE_THREADS)
+            // OPTIMIZATION: Multi-threaded SA inner loop
+            // Partition cells spatially and process in parallel
+            if (cfg.parallelRefine && cfg.threads > 1 && autoplaced.size() > 1000) {
+                run_parallel_inner_loop(inner_iters, autoplaced, chain_basis);
+            } else
+#endif
+            {
+                // Sequential SA inner loop
+                for (int m = 0; m < inner_iters; ++m) {
+                    // Loop through all automatically placed cells
+                    for (auto cell : autoplaced) {
+                        // Find another random Bel for this cell
+                        BelId try_bel = random_bel_for_cell(cell);
+                        // If valid, try and swap to a new position and see if
+                        // the new position is valid/worthwhile
+                        if (try_bel != BelId() && try_bel != cell->bel)
+                            try_swap_position(cell, try_bel);
+                    }
+                    // Also try swapping chains, if applicable
+                    for (auto cb : chain_basis) {
+                        Loc chain_base_loc = ctx->getBelLocation(cb->bel);
+                        BelId try_base = random_bel_for_cell(cb, chain_base_loc.z);
+                        if (try_base != BelId() && try_base != cb->bel)
+                            try_swap_chain(cb, try_base);
+                    }
                 }
             }
 
@@ -1258,6 +1364,19 @@ Placer1Cfg::Placer1Cfg(Context *ctx)
     slack_redist_iter = ctx->setting<int>("slack_redist_iter");
     hpwl_scale_x = 1;
     hpwl_scale_y = 1;
+    // Multi-threading settings
+    parallelRefine = ctx->setting<bool>("placer1/parallelRefine", false);
+    threads = ctx->setting<int>("placer1/threads", ctx->setting<int>("threads", 8));
+#if !defined(NPNR_DISABLE_THREADS)
+    // Clamp threads to reasonable values
+    threads = std::max(1, std::min(threads, 8));
+    // Only enable parallel mode if we have enough cells
+    if (ctx->cells.size() < 1000)
+        parallelRefine = false;
+#else
+    parallelRefine = false;
+    threads = 1;
+#endif
 }
 
 bool placer1(Context *ctx, Placer1Cfg cfg)
